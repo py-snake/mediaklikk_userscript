@@ -1,0 +1,32 @@
+# HAR files (contain sensitive request/response data)
+*.har
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node
+node_modules/
+package-lock.json
+yarn.lock
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build outputs
+dist/
+build/
+*.min.js
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
