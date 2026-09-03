@@ -1,6 +1,10 @@
 # HAR files (contain sensitive request/response data)
 *.har
 
+# Downloaded subtitle samples (test artifacts, not source)
+*.srt
+*.vtt
+
 # OS files
 .DS_Store
 Thumbs.db

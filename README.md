@@ -106,6 +106,9 @@ mediaklikk_userscript/
 
 | Version | Changes |
 |---------|---------|
+| **1.7.3** | Debug console logging (`DEBUG` flag, `[MediaKlikk-Extractor]` prefix); download mutual-exclusion guard; HTTP-status validation; robustness/hardening |
+| **1.6.x** | Video-change detection (XHR hook, message, poll); freshness-gated token binding; exhaustion/retry UI; SRT time fixes |
+| **1.5.x** | HLS embedded subtitle assembly fixes; proxy-less local SRT recovery |
 | **1.4.4** | URL normalization (`//` → `https:`); resizable panel with saved size; flex-body scrolling |
 | **1.4.3** | Per-recommended-video SRT recovery via permalink → `subtitlePath` → `player.php` |
 | **1.4.2** | Generation guard (`renderGen`) to prevent stale subtitle/quality overwrites |
