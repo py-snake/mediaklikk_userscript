@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MediaKlikk Stream Extractor
 // @namespace    mediaklikk-tools
-// @version      1.7.3
+// @version      1.8.1
 // @description  Extract m3u8 (all qualities), master m3u8, and SRT subtitle links from MediaKlikk videos (runs inside the player iframe)
 // @author       py-snake and opencode
 // @match        https://player.mediaklikk.hu/*
@@ -23,13 +23,13 @@
 //     rgba(20,20,30,0.88)  - dark, mostly opaque (default)
 //     rgba(20,20,30,0.60)  - dark, semi-transparent
 //     rgba(20,20,30,0.35)  - dark, very transparent
-var PANEL_BG = 'rgba(20,20,30,0.88)';
+var PANEL_BG = 'rgba(20,20,30,0.35)';
 
 // Header background
-var HEADER_BG = 'rgba(40,50,70,0.95)';
+var HEADER_BG = 'rgba(40,50,70,0.45)';
 
 // Panel opacity when minimized
-var PANEL_MINIMIZED_BG = 'rgba(40,50,70,0.95)';
+var PANEL_MINIMIZED_BG = 'rgba(40,50,70,0.45)';
 
 // Subtitle proxy API (subtitle_dl.php). Provides proxied SRT/VTT downloads
 // for the current video page URL. Fill in your own values below — never
@@ -147,6 +147,18 @@ var DEBUG = true;
         return baseDir + url;
     }
 
+    function compactQualityLabel(res, bw) {
+        var bwPart = bw ? Math.round(bw / 1000) + 'k' : '';
+        var resPart = '';
+        if (res) {
+            var p = String(res).split('x');
+            var h = p.length >= 2 ? p[1] : p[0];
+            resPart = /^\d+$/.test(h) ? (h + 'p') : String(res);
+        }
+        if (resPart && bwPart) return resPart + '/' + bwPart;
+        return resPart || bwPart || '?';
+    }
+
     function parseM3U8Variants(content, baseUrl) {
         var lines = [];
         var variants = [];
@@ -162,12 +174,12 @@ var DEBUG = true;
                 var nextLine = (i + 1 < lines.length) ? lines[i + 1].replace(/\r/g, '').trim() : '';
                 if (nextLine && nextLine.indexOf('#') !== 0) {
                     var u = resolveUrl(nextLine, baseDir);
-                    var bwPart = bwMatch ? Math.round(parseInt(bwMatch[1], 10) / 1000) + 'kbps' : '?';
+                    var bwVal = bwMatch ? parseInt(bwMatch[1], 10) : 0;
                     variants.push({
-                        bandwidth: bwMatch ? parseInt(bwMatch[1], 10) : 0,
+                        bandwidth: bwVal,
                         resolution: resMatch ? resMatch[1] : 'unknown',
                         url: u,
-                        label: resMatch ? (resMatch[1] + ' (' + bwPart + ')') : bwPart
+                        label: compactQualityLabel(resMatch ? resMatch[1] : null, bwVal)
                     });
                 }
             }
@@ -238,8 +250,13 @@ var DEBUG = true;
         if (!tsRe.test(start) || !tsRe.test(end)) return null;
         var off = offsetMs;
         if (typeof off !== 'number' || !isFinite(off)) off = 0;
-        return formatSrtTime(parseVttTime(start) + off) +
-            ' --> ' + formatSrtTime(parseVttTime(end) + off);
+        var startMs = parseVttTime(start) + off;
+        var endMs = parseVttTime(end) + off;
+        // Zero-duration cues (start == end, e.g. music/applause point markers)
+        // are not valid SRT; give them a minimum 500ms duration to match the
+        // PHP proxy output.
+        if (endMs <= startMs) endMs = startMs + 500;
+        return formatSrtTime(startMs) + ' --> ' + formatSrtTime(endMs);
     }
 
     // Build a single SRT document from segments with per-segment offsets.
@@ -284,25 +301,33 @@ var DEBUG = true;
                 out.push(clean);
             }
         }
-        return out.length ? (out.join('\n') + '\n') : '';
+        // Emit CRLF line endings plus a trailing blank line, matching the PHP
+        // proxy / mediaklikk server output byte-for-byte (SRT is CRLF with
+        // a blank line after the last cue).
+        return out.length ? (out.join('\r\n') + '\r\n\r\n') : '';
     }
 
     // Save a text string as a downloaded file (Firefox 52 compatible).
     // Returns true on success, false if the save could not be triggered.
+    // Key point for old Firefox + Violentmonkey: the Blob and its object URL
+    // must be created in the PAGE window context (unsafeWindow), not the
+    // userscript sandbox.
     function saveTextFile(filename, text) {
+        var pw = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+        var B = (pw.Blob) ? pw.Blob : Blob;
+        var U = (pw.URL && pw.URL.createObjectURL) ? pw.URL : URL;
         try {
-            var blob = new Blob([text], { type: 'text/plain' });
-            var blobUrl = URL.createObjectURL(blob);
+            var blob = new B([text], { type: 'text/plain' });
+            var blobUrl = U.createObjectURL(blob);
             var a = document.createElement('a');
             a.href = blobUrl;
             a.download = filename;
             document.body.appendChild(a);
             a.click();
-            // Long delay: slow machines need time to start the download.
             setTimeout(function() {
                 try { document.body.removeChild(a); } catch(e) {}
-                try { URL.revokeObjectURL(blobUrl); } catch(e2) {}
-            }, 1000);
+                try { U.revokeObjectURL(blobUrl); } catch(e2) {}
+            }, 2000);
             return true;
         } catch(e) {
             return false;
@@ -316,7 +341,7 @@ var DEBUG = true;
     // is shifted by the cumulative #EXTINF duration of prior segments.
     function downloadHlsSubtitle(playlistUrl, filename, btn) {
         if (!tryStartDownload(btn)) return;
-        dlog('downloadHlsSubtitle: start, playlist=' + playlistUrl.substring(0, 90));
+        dlog('downloadHlsSubtitle: start, playlist=' + playlistUrl);
         var orig = btn ? btn.textContent : null;
         function setBtn(t) { if (btn) btn.textContent = t; }
         function finishBtn(t, ms) {
@@ -647,17 +672,20 @@ var DEBUG = true;
                 // responseType is requested. If we don't have a real Blob, open in a tab.
                 if (blob && typeof blob === 'object' && typeof blob.size === 'number') {
                     try {
-                        var blobUrl = URL.createObjectURL(blob);
+                        // Create the object URL in the PAGE window context so old
+                        // Firefox 52 actually shows the download prompt.
+                        var pw = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+                        var U = (pw.URL && pw.URL.createObjectURL) ? pw.URL : URL;
+                        var blobUrl = U.createObjectURL(blob);
                         var a = document.createElement('a');
                         a.href = blobUrl;
                         a.download = filename;
                         document.body.appendChild(a);
                         a.click();
-                        // Long delay: slow machines need time to start the download.
                         setTimeout(function() {
                             try { document.body.removeChild(a); } catch(e) {}
-                            URL.revokeObjectURL(blobUrl);
-                        }, 1000);
+                            try { U.revokeObjectURL(blobUrl); } catch(e2) {}
+                        }, 2000);
                         endDownload();
                         if (done) done(null);
                     } catch(e) {
@@ -705,11 +733,11 @@ var DEBUG = true;
         var savedX = getVal('posX', 10);
         var savedY = getVal('posY', 10);
         var savedMin = getVal('minimized', false) === true;
-        var savedW = getVal('winW', 360);
-        var savedH = getVal('winH', 480);
+        var savedW = getVal('winW', 190);
+        var savedH = getVal('winH', 420);
         // Clamp stored size/position: corrupt values or a smaller viewport
         // must not collapse, explode, or push the panel off-screen.
-        if (typeof savedW !== 'number' || !isFinite(savedW) || savedW < 240) savedW = 360;
+        if (typeof savedW !== 'number' || !isFinite(savedW) || savedW < 150) savedW = 190;
         if (typeof savedH !== 'number' || !isFinite(savedH) || savedH < 120) savedH = 480;
         try {
             var vw = window.innerWidth || 1024;
@@ -727,7 +755,7 @@ var DEBUG = true;
         panel.style.cssText = 'position:fixed;z-index:2147483647;background:' + PANEL_BG + ';' +
             'border:1px solid rgba(100,140,200,0.4);border-radius:8px;color:#e0e0e0;' +
             'font-family:Arial,Helvetica,sans-serif;font-size:13px;padding:0;' +
-            'box-shadow:0 4px 20px rgba(0,0,0,0.5);min-width:240px;overflow:hidden;' +
+            'box-shadow:0 4px 20px rgba(0,0,0,0.5);min-width:150px;overflow:hidden;' +
             'display:flex;flex-direction:column;';
 
         panel.style.width = savedW + 'px';
@@ -747,7 +775,7 @@ var DEBUG = true;
         btnGroup.style.cssText = 'display:flex;align-items:center;';
 
         // Show URLs checkbox
-        var showUrls = getVal('showUrls', true) === true;
+        var showUrls = getVal('showUrls', false) === true;
 
         var cbWrap = document.createElement('label');
         cbWrap.style.cssText = 'display:flex;align-items:center;font-size:11px;color:#aaa;cursor:pointer;margin-right:8px;';
@@ -855,7 +883,7 @@ var DEBUG = true;
             if (isResizing && panel) {
                 var w = resizeStartW + (e.clientX - resizeStartX);
                 var h = resizeStartH + (e.clientY - resizeStartY);
-                w = Math.max(240, Math.min(w, window.innerWidth - 20));
+                w = Math.max(150, Math.min(w, window.innerWidth - 20));
                 h = Math.max(120, Math.min(h, window.innerHeight - 20));
                 panel.style.width = w + 'px';
                 panel.style.height = h + 'px';
@@ -896,18 +924,18 @@ var DEBUG = true;
         var minimized = body.style.display === 'none';
         if (minimized) {
             body.style.display = '';
-            panel.style.minWidth = '240px';
-            var rw = getVal('winW', 360);
-            var rh = getVal('winH', 480);
+            panel.style.minWidth = '150px';
+            var rw = getVal('winW', 190);
+            var rh = getVal('winH', 420);
             try {
                 var vw2 = window.innerWidth || 1024;
                 var vh2 = window.innerHeight || 768;
-                if (typeof rw !== 'number' || !isFinite(rw) || rw < 240) rw = 360;
-                if (typeof rh !== 'number' || !isFinite(rh) || rh < 120) rh = 480;
+                if (typeof rw !== 'number' || !isFinite(rw) || rw < 150) rw = 190;
+                if (typeof rh !== 'number' || !isFinite(rh) || rh < 120) rh = 420;
                 rw = Math.min(rw, vw2 - 20);
                 rh = Math.min(rh, vh2 - 20);
             } catch(e) {
-                rw = 360; rh = 480;
+                rw = 190; rh = 420;
             }
             panel.style.width = rw + 'px';
             panel.style.height = rh + 'px';
@@ -927,10 +955,11 @@ var DEBUG = true;
 
     function makeCopyBtn(text, label) {
         var btn = document.createElement('button');
-        var canonical = label || 'Copy';
+        var canonical = label || 'CP';
         btn.textContent = canonical;
+        btn.title = 'Copy to clipboard';
         btn.style.cssText = 'background:rgba(80,140,220,0.25);border:1px solid rgba(80,140,220,0.4);' +
-            'color:#8ac;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;margin-left:6px;' +
+            'color:#8ac;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
             'flex-shrink:0;';
         btn.addEventListener('click', function() {
             var ok = false;
@@ -959,34 +988,39 @@ var DEBUG = true;
 
     function makeDownloadBtn(url, filename) {
         var btn = document.createElement('button');
-        btn.textContent = 'Download';
+        btn.textContent = 'DL';
+        btn.title = 'Download';
         btn.style.cssText = 'background:rgba(220,140,40,0.25);border:1px solid rgba(220,140,40,0.4);' +
-            'color:#da8;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;margin-left:6px;' +
+            'color:#da8;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
             'flex-shrink:0;';
         btn.addEventListener('click', function() {
             if (btn.disabled) return;
             btn.disabled = true;
-            btn.textContent = 'Loading...';
+            btn.textContent = '...';
             try {
                 downloadFile(url, filename, function(err) {
                     btn.disabled = false;
                     if (!err) {
-                        btn.textContent = 'Saved!';
+                        btn.textContent = 'OK';
+                        setTimeout(function() { btn.textContent = 'DL'; }, 1200);
                     } else if (err === 'opened') {
-                        btn.textContent = 'Opened in tab';
+                        btn.textContent = 'TAB';
+                        setTimeout(function() { btn.textContent = 'DL'; }, 2000);
                     } else if (err === 'blocked') {
-                        btn.textContent = 'Popup blocked';
+                        btn.textContent = 'BLK';
+                        setTimeout(function() { btn.textContent = 'DL'; }, 2000);
                     } else if (err === 'busy') {
-                        btn.textContent = 'Busy';
+                        btn.textContent = 'BUSY';
+                        setTimeout(function() { btn.textContent = 'DL'; }, 1500);
                     } else {
-                        btn.textContent = 'Error';
+                        btn.textContent = 'ERR';
+                        setTimeout(function() { btn.textContent = 'DL'; }, 2000);
                     }
-                    setTimeout(function() { btn.textContent = 'Download'; }, 2000);
                 });
             } catch(e) {
                 btn.disabled = false;
-                btn.textContent = 'Error';
-                setTimeout(function() { btn.textContent = 'Download'; }, 2000);
+                btn.textContent = 'ERR';
+                setTimeout(function() { btn.textContent = 'DL'; }, 2000);
             }
         });
         return btn;
@@ -996,9 +1030,11 @@ var DEBUG = true;
     // segments into a single .srt file instead of downloading the .m3u8.
     function makeHlsDownloadBtn(playlistUrl, filename) {
         var btn = document.createElement('button');
-        btn.textContent = 'Download';
+        btn.__origLabel = 'DL';
+        btn.textContent = 'DL';
+        btn.title = 'Download / assemble';
         btn.style.cssText = 'background:rgba(220,140,40,0.25);border:1px solid rgba(220,140,40,0.4);' +
-            'color:#da8;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;margin-left:6px;' +
+            'color:#da8;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
             'flex-shrink:0;';
         btn.addEventListener('click', function() {
             if (btn.disabled) return;
@@ -1010,21 +1046,35 @@ var DEBUG = true;
 
     // --- UI: URL row ---
 
-    function buildUrlRow(fullUrl) {
-        var wrap = document.createElement('div');
-        wrap.style.cssText = 'display:flex;align-items:center;flex-wrap:wrap;';
+    // Compact item row: Copy + extra buttons first (left), then the label, then
+    // the URL (when "Show URLs" is checked) wraps below. Keeps the panel small.
+    function buildItemRow(label, fullUrl, extraButtons) {
+        var row = document.createElement('div');
+        row.style.cssText = 'background:rgba(255,255,255,0.04);border-radius:4px;' +
+            'padding:3px 6px;margin-bottom:2px;display:flex;align-items:center;flex-wrap:wrap;';
+
+        // Buttons on the left.
+        row.appendChild(makeCopyBtn(fullUrl, 'CP'));
+        if (extraButtons) {
+            for (var b = 0; b < extraButtons.length; b++) {
+                if (extraButtons[b]) row.appendChild(extraButtons[b]);
+            }
+        }
+
+        var lbl = document.createElement('span');
+        lbl.style.cssText = 'font-weight:bold;font-size:11px;color:#ccc;margin-left:4px;margin-right:4px;';
+        lbl.textContent = label;
+        row.appendChild(lbl);
 
         var urlSpan = document.createElement('span');
-        urlSpan.style.cssText = 'word-break:break-all;font-size:10px;color:#999;flex:1;min-width:80px;';
+        urlSpan.style.cssText = 'word-break:break-all;font-size:10px;color:#999;flex-basis:100%;min-width:0;';
         urlSpan.textContent = fullUrl;
-
-        var showUrls = getVal('showUrls', true) === true;
+        var showUrls = getVal('showUrls', false) === true;
         if (!showUrls) urlSpan.style.display = 'none';
         allUrlSpans.push(urlSpan);
+        row.appendChild(urlSpan);
 
-        wrap.appendChild(urlSpan);
-        wrap.appendChild(makeCopyBtn(fullUrl, 'Copy'));
-        return wrap;
+        return row;
     }
 
     // --- Subtitle filename helper ---
@@ -1084,6 +1134,17 @@ var DEBUG = true;
         }
     }
 
+    // Consistent SRT filename across all download paths: use the video-page
+    // slug (e.g. "tolcsvay-laszlo-magyar-mise-uj-magyar-rapszodia_0.srt") so
+    // local and proxy downloads share one name. Falls back when no page URL.
+    function subtitleDownloadName(pageUrl, index, fallback) {
+        if (pageUrl) {
+            var slug = pageSlug(pageUrl);
+            if (slug) return slug + '_' + (index || 0) + '.srt';
+        }
+        return fallback;
+    }
+
     function buildSubtitleApiUrl(pageUrl, index, format) {
         if (typeof pageUrl !== 'string' || !pageUrl) return null;
         return API_BASE + '/api/subtitle_dl.php?token=' + encodeURIComponent(API_TOKEN) +
@@ -1098,7 +1159,9 @@ var DEBUG = true;
     // parsing instead of relying on Content-Type. Saves via saveTextFile.
     function downloadSubtitleApi(apiUrl, btn, fallbackName) {
         if (!tryStartDownload(btn)) return;
-        dlog('downloadSubtitleApi: start proxy download ' + apiUrl.substring(0, 90));
+        var tok = (typeof API_TOKEN === 'string') ? API_TOKEN : '';
+        dlog('downloadSubtitleApi: tokenLen=' + tok.length + ' configured=' + isApiConfigured());
+        dlog('downloadSubtitleApi: start proxy download ' + apiUrl);
         var orig = btn ? btn.textContent : null;
         function doneBtn(t, ms) {
             endDownload();
@@ -1206,9 +1269,10 @@ var DEBUG = true;
 
     function makeApiDownloadBtn(apiUrl, filename) {
         var btn = document.createElement('button');
-        btn.textContent = 'Download';
+        btn.textContent = 'DL';
+        btn.title = 'Download via proxy';
         btn.style.cssText = 'background:rgba(220,140,40,0.25);border:1px solid rgba(220,140,40,0.4);' +
-            'color:#da8;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;margin-left:6px;' +
+            'color:#da8;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
             'flex-shrink:0;';
         btn.addEventListener('click', function() {
             if (btn.disabled) return;
@@ -1225,21 +1289,12 @@ var DEBUG = true;
         var apiSrtUrl = buildSubtitleApiUrl(data.pageUrl, 0, 'srt');
         if (!apiSrtUrl) return false;
         var apiLabel = document.createElement('div');
-        apiLabel.style.cssText = 'font-weight:bold;color:#7ab8ff;margin-bottom:6px;font-size:12px;';
+        apiLabel.style.cssText = 'font-weight:bold;color:#7ab8ff;margin-bottom:6px;font-size:11px;';
         if (addTopMargin) apiLabel.style.marginTop = '8px';
-        apiLabel.textContent = 'Subtitles (via proxy)';
+        apiLabel.textContent = 'Proxy';
         sSection.appendChild(apiLabel);
 
-        var apiSrtRow = document.createElement('div');
-        apiSrtRow.style.cssText = 'background:rgba(255,255,255,0.04);border-radius:4px;padding:6px 8px;margin-bottom:4px;';
-        var apiSrtTitle = document.createElement('div');
-        apiSrtTitle.style.cssText = 'font-weight:bold;font-size:12px;color:#ccc;margin-bottom:3px;';
-        apiSrtTitle.textContent = 'SRT [index 0]';
-        apiSrtRow.appendChild(apiSrtTitle);
-        var apiSrtWrap = buildUrlRow(apiSrtUrl);
-        apiSrtWrap.appendChild(makeApiDownloadBtn(apiSrtUrl, slug + '_0.srt'));
-        apiSrtRow.appendChild(apiSrtWrap);
-        sSection.appendChild(apiSrtRow);
+        sSection.appendChild(buildItemRow('SRT', apiSrtUrl, [makeApiDownloadBtn(apiSrtUrl, slug + '_0.srt')]));
         return true;
     }
 
@@ -1292,11 +1347,7 @@ var DEBUG = true;
             var masterSection = document.createElement('div');
             masterSection.style.cssText = 'margin-bottom:10px;';
 
-            var masterLabel = document.createElement('div');
-            masterLabel.style.cssText = 'font-weight:bold;color:#7ab8ff;margin-bottom:4px;font-size:12px;';
-            masterLabel.textContent = 'Master Playlist (all qualities)';
-            masterSection.appendChild(masterLabel);
-            masterSection.appendChild(buildUrlRow(data.m3u8));
+            masterSection.appendChild(buildItemRow('Master', data.m3u8));
             body.appendChild(masterSection);
         }
 
@@ -1304,7 +1355,7 @@ var DEBUG = true;
         if (data.loadError) {
             var warnSection = document.createElement('div');
             warnSection.style.cssText = 'background:rgba(200,80,80,0.12);border:1px solid rgba(200,80,80,0.4);' +
-                'border-radius:4px;padding:6px 8px;margin-bottom:10px;font-size:12px;color:#f88;';
+                'border-radius:4px;padding:6px 8px;margin-bottom:10px;font-size:11px;color:#f88;';
             warnSection.textContent = 'Quality list failed to load. ';
             var retryBtn = document.createElement('button');
             retryBtn.textContent = 'Retry';
@@ -1323,21 +1374,13 @@ var DEBUG = true;
             qSection.style.cssText = 'margin-bottom:10px;';
 
             var qLabel = document.createElement('div');
-            qLabel.style.cssText = 'font-weight:bold;color:#7ab8ff;margin-bottom:6px;font-size:12px;';
-            qLabel.textContent = 'Quality Variants (' + data.qualities.length + ')';
+            qLabel.style.cssText = 'font-weight:bold;color:#7ab8ff;margin-bottom:6px;font-size:11px;';
+            qLabel.textContent = 'Qualities (' + data.qualities.length + ')';
             qSection.appendChild(qLabel);
 
             for (var q = 0; q < data.qualities.length; q++) {
                 var v = data.qualities[q];
-                var vRow = document.createElement('div');
-                vRow.style.cssText = 'background:rgba(255,255,255,0.04);border-radius:4px;padding:6px 8px;margin-bottom:4px;';
-
-                var vTitle = document.createElement('div');
-                vTitle.style.cssText = 'font-weight:bold;font-size:12px;color:#ccc;margin-bottom:3px;';
-                vTitle.textContent = v.label;
-                vRow.appendChild(vTitle);
-                vRow.appendChild(buildUrlRow(v.url));
-                qSection.appendChild(vRow);
+                qSection.appendChild(buildItemRow(v.label, v.url));
             }
             body.appendChild(qSection);
         }
@@ -1345,7 +1388,7 @@ var DEBUG = true;
         // Subtitles
         var sSection = document.createElement('div');
         var sLabel = document.createElement('div');
-        sLabel.style.cssText = 'font-weight:bold;color:#7ab8ff;margin-bottom:6px;font-size:12px;';
+        sLabel.style.cssText = 'font-weight:bold;color:#7ab8ff;margin-bottom:6px;font-size:11px;';
 
         var hasAnySub = (data.srt.length > 0) || (data.hlsSubtitles.length > 0);
         // Proxied subtitles resolve server-side from the video page URL, so
@@ -1353,48 +1396,28 @@ var DEBUG = true;
         var hasProxy = !!(data.pageUrl && isApiConfigured());
 
         if (data.srt.length > 0) {
-            sLabel.textContent = 'Subtitles (SRT)';
+            sLabel.textContent = 'SRT';
             sSection.appendChild(sLabel);
 
             for (var s = 0; s < data.srt.length; s++) {
                 var sub = data.srt[s];
-                var sRow = document.createElement('div');
-                sRow.style.cssText = 'background:rgba(255,255,255,0.04);border-radius:4px;padding:6px 8px;margin-bottom:4px;';
-
-                var sTitle = document.createElement('div');
-                sTitle.style.cssText = 'font-weight:bold;font-size:12px;color:#ccc;margin-bottom:3px;';
-                sTitle.textContent = sub.label + (sub.lang ? ' [' + sub.lang + ']' : '');
-                sRow.appendChild(sTitle);
-
-                var sUrlWrap = buildUrlRow(sub.url);
-                sUrlWrap.appendChild(makeDownloadBtn(sub.url, getSrtFilename(sub.url)));
-                sRow.appendChild(sUrlWrap);
-                sSection.appendChild(sRow);
+                var sLabel2 = sub.label || 'SRT';
+                sSection.appendChild(buildItemRow(sLabel2, sub.url, [makeDownloadBtn(sub.url, subtitleDownloadName(data.pageUrl, s, getSrtFilename(sub.url)))]));
             }
         }
 
         if (data.hlsSubtitles.length > 0) {
             if (data.srt.length > 0) {
                 sLabel = document.createElement('div');
-                sLabel.style.cssText = 'font-weight:bold;color:#7ab8ff;margin-top:8px;margin-bottom:6px;font-size:12px;';
+                sLabel.style.cssText = 'font-weight:bold;color:#7ab8ff;margin-top:8px;margin-bottom:6px;font-size:11px;';
             }
-            sLabel.textContent = 'Subtitles (HLS embedded)';
+            sLabel.textContent = 'HLS';
             sSection.appendChild(sLabel);
 
             for (var h = 0; h < data.hlsSubtitles.length; h++) {
                 var hsub = data.hlsSubtitles[h];
-                var hRow = document.createElement('div');
-                hRow.style.cssText = 'background:rgba(255,255,255,0.04);border-radius:4px;padding:6px 8px;margin-bottom:4px;';
-
-                var hTitle = document.createElement('div');
-                hTitle.style.cssText = 'font-weight:bold;font-size:12px;color:#ccc;margin-bottom:3px;';
-                hTitle.textContent = hsub.name + ' [' + hsub.lang + ']';
-                hRow.appendChild(hTitle);
-
-                var hUrlWrap = buildUrlRow(hsub.url);
-                hUrlWrap.appendChild(makeHlsDownloadBtn(hsub.url, 'subtitle_' + hsub.lang + '.srt'));
-                hRow.appendChild(hUrlWrap);
-                sSection.appendChild(hRow);
+                var hLabel = hsub.name || 'HLS';
+                sSection.appendChild(buildItemRow(hLabel, hsub.url, [makeHlsDownloadBtn(hsub.url, subtitleDownloadName(data.pageUrl, h, 'subtitle_' + hsub.lang + '.srt'))]));
             }
         }
 
@@ -1403,7 +1426,7 @@ var DEBUG = true;
         }
 
         if (!hasAnySub && !hasProxy) {
-            sLabel.style.cssText = 'font-weight:bold;color:#888;margin-bottom:6px;font-size:12px;';
+            sLabel.style.cssText = 'font-weight:bold;color:#888;margin-bottom:6px;font-size:11px;';
             sLabel.textContent = 'No subtitles available';
             sSection.appendChild(sLabel);
             var hint = document.createElement('div');
@@ -1462,6 +1485,7 @@ var DEBUG = true;
         if (downloadBusy) dlog('endDownload: download slot released');
         downloadBusy = false;
     }
+
     // Render generation: only the newest requested render may paint the panel,
     // so a slow fetch from a previous video can never overwrite a newer one.
     var renderGen = 0;
@@ -1500,7 +1524,7 @@ var DEBUG = true;
         if (typeof m3u8Url !== 'string' || !m3u8Url) return;
         m3u8Url = normalizeUrl(m3u8Url);
         if (m3u8Url === currentM3u8) return;
-        dlog('renderNewVideo: new video detected, m3u8=' + m3u8Url.substring(0, 80) + '... token=' + (token ? 'yes' : 'no'));
+        dlog('renderNewVideo: new video detected, m3u8=' + m3u8Url + ' token=' + (token ? 'yes' : 'no'));
         currentM3u8 = m3u8Url;
         var gen = ++renderGen;
         // Bind token + permalink to THIS render only when they come from a
@@ -1647,7 +1671,7 @@ var DEBUG = true;
                     try {
                         var d = JSON.parse(self.responseText);
                         if (d && d.url) {
-                            dlog('XHR hook: get_video_url.php -> new video url=' + d.url.substring(0, 80));
+                            dlog('XHR hook: get_video_url.php -> new video url=' + d.url);
                             renderNewVideo(d.url, token || lastVideoToken);
                         } else {
                             dwarn('XHR hook: get_video_url.php response had no url');
@@ -1673,7 +1697,7 @@ var DEBUG = true;
                     if (w.pl && w.pl.getPlaylistItem) {
                         var it = w.pl.getPlaylistItem();
                         if (it && it.file) {
-                            dlog('video-url-loaded: fallback read new file=' + it.file.substring(0, 80));
+                            dlog('video-url-loaded: fallback read new file=' + it.file);
                             renderNewVideo(it.file, lastVideoToken);
                         }
                     }
@@ -1820,7 +1844,7 @@ var DEBUG = true;
         var btn = document.createElement('button');
         btn.textContent = 'Retry';
         btn.style.cssText = 'background:rgba(80,140,220,0.25);border:1px solid rgba(80,140,220,0.4);' +
-            'color:#8ac;padding:5px 16px;border-radius:4px;cursor:pointer;font-size:12px;';
+            'color:#8ac;padding:5px 16px;border-radius:4px;cursor:pointer;font-size:11px;';
         btn.addEventListener('click', function() {
             resetExtraction();
         });
@@ -1835,7 +1859,7 @@ var DEBUG = true;
     function monitorUrlChanges() {
         window.setInterval(function() {
             if (window.location.href !== lastUrl) {
-                dlog('monitorUrlChanges: iframe URL changed -> ' + window.location.href.substring(0, 80));
+                dlog('monitorUrlChanges: iframe URL changed -> ' + window.location.href);
                 lastUrl = window.location.href;
                 resetExtraction();
                 return;
@@ -1845,7 +1869,7 @@ var DEBUG = true;
                 if (w.pl && w.pl.getPlaylistItem) {
                     var it = w.pl.getPlaylistItem();
                     if (it && it.file && normalizeUrl(it.file) !== currentM3u8) {
-                        dlog('monitorUrlChanges: poll detected new file=' + it.file.substring(0, 80));
+                        dlog('monitorUrlChanges: poll detected new file=' + it.file);
                         renderNewVideo(it.file, lastVideoToken);
                     }
                 }
@@ -1856,7 +1880,7 @@ var DEBUG = true;
     }
 
     function init() {
-        dlog('init: starting, url=' + window.location.href.substring(0, 80));
+        dlog('init: starting, url=' + window.location.href);
         lastUrl = window.location.href;
         hookVideoChanges();
         // Immediate feedback so slow loads never look dead.
