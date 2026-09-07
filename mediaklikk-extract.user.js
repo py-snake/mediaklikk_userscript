@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MediaKlikk Stream Extractor
 // @namespace    mediaklikk-tools
-// @version      1.8.1
+// @version      1.9.1
 // @description  Extract m3u8 (all qualities), master m3u8, and SRT subtitle links from MediaKlikk videos (runs inside the player iframe)
 // @author       py-snake and opencode
 // @match        https://player.mediaklikk.hu/*
@@ -238,10 +238,12 @@ var DEBUG = true;
         return pad2(h) + ':' + pad2(m) + ':' + pad2(s) + ',' + pad3(milli);
     }
 
-    // Shift a VTT cue timing line by offsetMs and emit clean SRT timing
-    // (VTT cue settings after the end timestamp are stripped).
-    // Returns null when the line has no parseable timestamps.
-    function shiftTimingLine(line, offsetMs) {
+    // Parse a VTT/SRT cue timing line shifted by offsetMs into absolute
+    // milliseconds. Returns null when the line has no parseable timestamps.
+    // Zero-duration cues are NOT fixed here: they keep their raw end time so
+    // duplicate-merging behaves like the PHP client (the end=start+500ms
+    // minimum is applied only at serialization, after merging).
+    function parseCueTimes(line, offsetMs) {
         var parts = line.split('-->');
         if (parts.length < 2) return null;
         var start = parts[0].replace(/^\s+|\s+$/g, '');
@@ -250,22 +252,56 @@ var DEBUG = true;
         if (!tsRe.test(start) || !tsRe.test(end)) return null;
         var off = offsetMs;
         if (typeof off !== 'number' || !isFinite(off)) off = 0;
-        var startMs = parseVttTime(start) + off;
-        var endMs = parseVttTime(end) + off;
-        // Zero-duration cues (start == end, e.g. music/applause point markers)
-        // are not valid SRT; give them a minimum 500ms duration to match the
-        // PHP proxy output.
-        if (endMs <= startMs) endMs = startMs + 500;
-        return formatSrtTime(startMs) + ' --> ' + formatSrtTime(endMs);
+        return {
+            startMs: parseVttTime(start) + off,
+            endMs: parseVttTime(end) + off
+        };
+    }
+
+    // Normalized identity of a cue body for duplicate comparison: exact line
+    // equality after each line is right-trimmed and trailing blank lines are
+    // stripped (mirrors SubtitleConverter::cueTextKey in the PHP client).
+    function cueTextKey(text) {
+        if (!text) return '';
+        var key = [];
+        for (var i = 0; i < text.length; i++) {
+            key.push(text[i].replace(/[\t ]+$/g, ''));
+        }
+        while (key.length > 0 && key[key.length - 1] === '') key.pop();
+        return key.join('\n');
+    }
+
+    // Merge consecutive cues whose body is identical into one cue spanning
+    // [first.start, max(end)] — time-code extension, not deletion, so the
+    // line stays visible without gaps. Mirrors the PHP client's
+    // SubtitleConverter::mergeConsecutiveDuplicates: identical text separated
+    // by different text (e.g. a refrain that recurs later) is NOT merged.
+    function mergeConsecutiveDuplicates(cues) {
+        var merged = [];
+        for (var i = 0; i < cues.length; i++) {
+            var cue = cues[i];
+            if (merged.length > 0 &&
+                    cueTextKey(merged[merged.length - 1].text) === cueTextKey(cue.text)) {
+                if (cue.endMs > merged[merged.length - 1].endMs) {
+                    merged[merged.length - 1].endMs = cue.endMs;
+                }
+                continue;
+            }
+            merged.push(cue);
+        }
+        return merged;
     }
 
     // Build a single SRT document from segments with per-segment offsets.
     // Each segment's cues are relative to that segment, so every cue timing
     // is shifted by the cumulative #EXTINF duration of prior segments.
+    // All segments are first parsed into ONE absolute-time cue list (so a
+    // duplicate that straddles a segment boundary collapses too), then
+    // consecutive duplicate cues are merged, then the document is serialized.
     function buildSrt(segTexts) {
-        var out = [];
-        var cueIndex = 0;
         if (!segTexts || !segTexts.length) return '';
+        var cues = [];
+        var cur = null;
         for (var i = 0; i < segTexts.length; i++) {
             var seg = segTexts[i] || {};
             var off = seg.offsetMs;
@@ -281,14 +317,12 @@ var DEBUG = true;
                 if (line === '') { skipText = false; continue; }
                 if (skipText) continue;
                 if (line.indexOf('-->') >= 0) {
-                    var shifted = shiftTimingLine(line, off);
-                    // Skip malformed timing lines instead of emitting garbage cues,
-                    // and suppress any orphan text that belonged to them.
-                    if (!shifted) { skipText = true; continue; }
-                    cueIndex++;
-                    if (out.length > 0) out.push('');
-                    out.push(String(cueIndex));
-                    out.push(shifted);
+                    var t = parseCueTimes(line, off);
+                    // Skip malformed timing lines instead of emitting garbage
+                    // cues, and suppress any orphan text that belonged to them.
+                    if (!t) { skipText = true; continue; }
+                    if (cur && cur.text.length > 0) cues.push(cur);
+                    cur = { startMs: t.startMs, endMs: t.endMs, text: [] };
                     continue;
                 }
                 // Cue identifier (a text line directly before a timing line)
@@ -298,8 +332,24 @@ var DEBUG = true;
                 // trim, to match plain SRT text.
                 var clean = line.replace(/<[^>]*>/g, '').replace(/^\s+|\s+$/g, '');
                 if (clean === '') continue;
-                out.push(clean);
+                if (cur) cur.text.push(clean);
             }
+            if (cur && cur.text.length > 0) { cues.push(cur); cur = null; }
+        }
+
+        cues = mergeConsecutiveDuplicates(cues);
+
+        var out = [];
+        var cueIndex = 0;
+        for (var k = 0; k < cues.length; k++) {
+            var cue = cues[k];
+            var endMs = cue.endMs;
+            if (endMs <= cue.startMs) endMs = cue.startMs + 500;
+            cueIndex++;
+            if (out.length > 0) out.push('');
+            out.push(String(cueIndex));
+            out.push(formatSrtTime(cue.startMs) + ' --> ' + formatSrtTime(endMs));
+            for (var m = 0; m < cue.text.length; m++) out.push(cue.text[m]);
         }
         // Emit CRLF line endings plus a trailing blank line, matching the PHP
         // proxy / mediaklikk server output byte-for-byte (SRT is CRLF with
@@ -953,14 +1003,23 @@ var DEBUG = true;
 
     // --- UI: Buttons ---
 
-    function makeCopyBtn(text, label) {
+    function makeCopyBtn(text, label, kind) {
         var btn = document.createElement('button');
-        var canonical = label || 'CP';
-        btn.textContent = canonical;
-        btn.title = 'Copy to clipboard';
-        btn.style.cssText = 'background:rgba(80,140,220,0.25);border:1px solid rgba(80,140,220,0.4);' +
-            'color:#8ac;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
-            'flex-shrink:0;';
+        btn.textContent = 'CP';
+        btn.title = label || 'Copy to clipboard';
+        if (kind === 'hls') {
+            btn.style.cssText = 'background:rgba(220,80,80,0.25);border:1px solid rgba(220,80,80,0.4);' +
+                'color:#d88;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
+                'flex-shrink:0;';
+        } else if (kind === 'srt') {
+            btn.style.cssText = 'background:rgba(80,180,100,0.25);border:1px solid rgba(80,180,100,0.4);' +
+                'color:#8d8;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
+                'flex-shrink:0;';
+        } else {
+            btn.style.cssText = 'background:rgba(80,140,220,0.25);border:1px solid rgba(80,140,220,0.4);' +
+                'color:#8ac;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
+                'flex-shrink:0;';
+        }
         btn.addEventListener('click', function() {
             var ok = false;
             try { ok = copyToClipboard(text) ? true : false; }
@@ -977,7 +1036,7 @@ var DEBUG = true;
                 btn.style.color = '#f88';
             }
             setTimeout(function() {
-                btn.textContent = canonical;
+                btn.textContent = 'CP';
                 btn.style.background = '';
                 btn.style.borderColor = '';
                 btn.style.color = '';
@@ -990,8 +1049,8 @@ var DEBUG = true;
         var btn = document.createElement('button');
         btn.textContent = 'DL';
         btn.title = 'Download';
-        btn.style.cssText = 'background:rgba(220,140,40,0.25);border:1px solid rgba(220,140,40,0.4);' +
-            'color:#da8;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
+        btn.style.cssText = 'background:rgba(80,180,100,0.25);border:1px solid rgba(80,180,100,0.4);' +
+            'color:#8d8;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
             'flex-shrink:0;';
         btn.addEventListener('click', function() {
             if (btn.disabled) return;
@@ -1033,8 +1092,8 @@ var DEBUG = true;
         btn.__origLabel = 'DL';
         btn.textContent = 'DL';
         btn.title = 'Download / assemble';
-        btn.style.cssText = 'background:rgba(220,140,40,0.25);border:1px solid rgba(220,140,40,0.4);' +
-            'color:#da8;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
+        btn.style.cssText = 'background:rgba(220,80,80,0.25);border:1px solid rgba(220,80,80,0.4);' +
+            'color:#d88;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
             'flex-shrink:0;';
         btn.addEventListener('click', function() {
             if (btn.disabled) return;
@@ -1048,21 +1107,25 @@ var DEBUG = true;
 
     // Compact item row: Copy + extra buttons first (left), then the label, then
     // the URL (when "Show URLs" is checked) wraps below. Keeps the panel small.
-    function buildItemRow(label, fullUrl, extraButtons) {
+    function buildItemRow(label, fullUrl, extraButtons, cpKind) {
         var row = document.createElement('div');
         row.style.cssText = 'background:rgba(255,255,255,0.04);border-radius:4px;' +
             'padding:3px 6px;margin-bottom:2px;display:flex;align-items:center;flex-wrap:wrap;';
 
         // Buttons on the left.
-        row.appendChild(makeCopyBtn(fullUrl, 'CP'));
+        row.appendChild(makeCopyBtn(fullUrl, label, cpKind));
         if (extraButtons) {
             for (var b = 0; b < extraButtons.length; b++) {
                 if (extraButtons[b]) row.appendChild(extraButtons[b]);
             }
         }
 
-        var lbl = document.createElement('span');
-        lbl.style.cssText = 'font-weight:bold;font-size:11px;color:#ccc;margin-left:4px;margin-right:4px;';
+        var lbl = document.createElement('a');
+        lbl.href = fullUrl || '#';
+        lbl.target = '_blank';
+        lbl.rel = 'noopener noreferrer';
+        lbl.style.cssText = 'font-weight:bold;font-size:11px;color:#ccc;margin-left:4px;margin-right:4px;' +
+            'cursor:pointer;text-decoration:none;';
         lbl.textContent = label;
         row.appendChild(lbl);
 
@@ -1134,24 +1197,122 @@ var DEBUG = true;
         }
     }
 
-    // Consistent SRT filename across all download paths: use the video-page
-    // slug (e.g. "tolcsvay-laszlo-magyar-mise-uj-magyar-rapszodia_0.srt") so
-    // local and proxy downloads share one name. Falls back when no page URL.
+    // Consistent SRT filename across all download paths: always use the
+    // video-page slug (e.g. "szilaj-a-szabadon-szaguldo-lucky-es-a-kalandos-
+    // kezbesites.srt"). Additional tracks get a numeric suffix (_1, _2, ...).
+    // Falls back when no page URL.
     function subtitleDownloadName(pageUrl, index, fallback) {
         if (pageUrl) {
             var slug = pageSlug(pageUrl);
-            if (slug) return slug + '_' + (index || 0) + '.srt';
+            if (slug) {
+                if (index > 0) return slug + '_' + index + '.srt';
+                return slug + '.srt';
+            }
         }
         return fallback;
     }
 
-    function buildSubtitleApiUrl(pageUrl, index, format) {
+    function buildSubtitleApiUrl(pageUrl, index, format, download) {
         if (typeof pageUrl !== 'string' || !pageUrl) return null;
         return API_BASE + '/api/subtitle_dl.php?token=' + encodeURIComponent(API_TOKEN) +
             '&url=' + encodeURIComponent(pageUrl) +
             '&index=' + (index || 0) +
             '&format=' + (format || 'srt') +
-            '&download=1';
+            '&download=' + (download === undefined ? 1 : (download ? 1 : 0));
+    }
+
+    // --- Proxy availability check ---
+    // The proxy API answers with {"error":"no_subtitles"} when the video has
+    // no subtitle tracks. Remember that answer so the Proxy option is not
+    // offered for such videos.
+
+    var proxyStateCache = {};    // pageUrl -> 'unknown' | 'ok' | 'none' | 'error'
+    var proxyKindCache = {};     // pageUrl -> 'hls' | 'srt' (proxy subtitle source)
+    var proxyCheckInflight = {}; // pageUrl -> true
+
+    function getProxyState(pageUrl) {
+        if (typeof pageUrl !== 'string' || !pageUrl) return 'unknown';
+        var s = proxyStateCache[pageUrl];
+        return s ? s : 'unknown';
+    }
+
+    // Known subtitle source kind the proxy serves for this video, or null.
+    function getProxyKind(pageUrl) {
+        if (typeof pageUrl !== 'string' || !pageUrl) return null;
+        var k = proxyKindCache[pageUrl];
+        return k ? k : null;
+    }
+
+    // The proxy reports where the subtitle came from (X-Subtitle-Source):
+    // embedded HLS tracks ('hls') or a direct sidecar file ('srt').
+    function getProxyKindFromHeaders(resp) {
+        var rh = (resp && resp.responseHeaders) || '';
+        var m = rh.match(/X-Subtitle-Source:\s*([^\r\n]+)/i);
+        if (!m) return null;
+        var src = m[1].toLowerCase();
+        if (/hls|embedded|m3u8/.test(src)) return 'hls';
+        return 'srt';
+    }
+
+    // Ask the proxy (no download) whether subtitles exist for the page URL.
+    // The result is cached; the callback receives 'ok' | 'none' | 'error'.
+    // Slow "embedded subtitle" answers fall back to 'error', which keeps the
+    // Proxy row visible (the real download uses its own long timeout).
+    function probeProxy(pageUrl, cb) {
+        if (!pageUrl || proxyCheckInflight[pageUrl]) return;
+        var probeUrl = buildSubtitleApiUrl(pageUrl, 0, 'srt', false);
+        if (!probeUrl || typeof GM_xmlhttpRequest !== 'function') {
+            proxyStateCache[pageUrl] = 'error';
+            if (cb) cb('error');
+            return;
+        }
+        proxyCheckInflight[pageUrl] = true;
+        function finish(state, kind) {
+            proxyStateCache[pageUrl] = state;
+            if (kind) proxyKindCache[pageUrl] = kind;
+            delete proxyCheckInflight[pageUrl];
+            if (cb) cb(state);
+        }
+        try {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: probeUrl,
+                timeout: 30000,
+                onload: function(resp) {
+                    var status = resp ? resp.status : 0;
+                    var kind = getProxyKindFromHeaders(resp);
+                    if (typeof status === 'number' && status !== 0 && (status < 200 || status >= 300)) {
+                        finish(status === 404 ? 'none' : 'error');
+                        return;
+                    }
+                    var text = '';
+                    if (resp && typeof resp.responseText === 'string') text = resp.responseText;
+                    else if (resp && typeof resp.response === 'string') text = resp.response;
+                    if (!text) { finish('error'); return; }
+                    var trimmed = text.replace(/^\s+/, '');
+                    var lowerHead = trimmed.substring(0, 9).toLowerCase();
+                    if (lowerHead.substring(0, 5) === '<html' || lowerHead === '<!doctype') {
+                        finish('error');
+                        return;
+                    }
+                    if (trimmed.charAt(0) === '{') {
+                        try {
+                            var obj = JSON.parse(trimmed);
+                            if (obj && obj.error) {
+                                finish(obj.error === 'no_subtitles' ? 'none' : 'error');
+                                return;
+                            }
+                        } catch(e) {}
+                    }
+                    // Anything else looks like real subtitle content.
+                    finish('ok', kind);
+                },
+                ontimeout: function() { finish('error'); },
+                onerror: function() { finish('error'); }
+            });
+        } catch(e) {
+            finish('error');
+        }
     }
 
     // Download through the proxy API. The subtitle is text, so fetch it as
@@ -1237,15 +1398,34 @@ var DEBUG = true;
                 }
                 var name = fallbackName || 'subtitle.srt';
                 var rh = (resp && resp.responseHeaders) || '';
-                var fm = rh.match(/filename="([^"]+)"/i);
-                if (fm) name = fm[1];
-                var fm2 = rh.match(/filename\*=UTF-8''([^;\r\n]+)/i);
-                if (fm2) {
-                    try { name = decodeURIComponent(fm2[1]); }
-                    catch(e) {}
+                // The URL-based name (fallbackName) always wins, so downloads
+                // are named after the video page in every scenario. The
+                // server's header filename is only a fallback when no
+                // URL-based name is available.
+                if (!fallbackName) {
+                    var fm = rh.match(/filename="([^"]+)"/i);
+                    if (fm) name = fm[1];
+                    var fm2 = rh.match(/filename\*=UTF-8''([^;\r\n]+)/i);
+                    if (fm2) {
+                        try { name = decodeURIComponent(fm2[1]); }
+                        catch(e) {}
+                    }
                 }
                 var srcm = rh.match(/X-Subtitle-Source:\s*([^\r\n]+)/i);
                 var src = srcm ? srcm[1].replace(/^\s+|\s+$/g, '') : '';
+                // Remember the real subtitle source for future renders so the
+                // proxy row keeps its correct color even if the probe failed.
+                if (src) {
+                    var pu = '';
+                    var um = apiUrl.match(/[?&]url=([^&]+)/);
+                    if (um) {
+                        try { pu = decodeURIComponent(um[1]); }
+                        catch(e) { pu = um[1]; }
+                    }
+                    if (pu) {
+                        proxyKindCache[pu] = /hls|embedded|m3u8/i.test(src) ? 'hls' : 'srt';
+                    }
+                }
                 name = getSrtFilename(name);
                 if (saveTextFile(name, text)) {
                     doneBtn('Saved!' + (src ? ' (' + src + ')' : ''), 1500);
@@ -1267,13 +1447,19 @@ var DEBUG = true;
         }
     }
 
-    function makeApiDownloadBtn(apiUrl, filename) {
+    function makeApiDownloadBtn(apiUrl, filename, kind) {
         var btn = document.createElement('button');
         btn.textContent = 'DL';
         btn.title = 'Download via proxy';
-        btn.style.cssText = 'background:rgba(220,140,40,0.25);border:1px solid rgba(220,140,40,0.4);' +
-            'color:#da8;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
-            'flex-shrink:0;';
+        if (kind === 'hls') {
+            btn.style.cssText = 'background:rgba(220,80,80,0.25);border:1px solid rgba(220,80,80,0.4);' +
+                'color:#d88;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
+                'flex-shrink:0;';
+        } else {
+            btn.style.cssText = 'background:rgba(80,180,100,0.25);border:1px solid rgba(80,180,100,0.4);' +
+                'color:#8d8;padding:1px 5px;border-radius:3px;cursor:pointer;font-size:10px;margin-left:4px;' +
+                'flex-shrink:0;';
+        }
         btn.addEventListener('click', function() {
             if (btn.disabled) return;
             btn.disabled = true;
@@ -1285,16 +1471,30 @@ var DEBUG = true;
     // Appends the "Subtitles (via proxy)" block for the given render data.
     // Independent of local results: only needs data.pageUrl + configured API.
     function appendProxySection(sSection, data, addTopMargin) {
-        var slug = pageSlug(data.pageUrl);
-        var apiSrtUrl = buildSubtitleApiUrl(data.pageUrl, 0, 'srt');
+        var pageUrl = data.pageUrl;
+        // The proxy answered "no subtitles" for this video: don't offer it.
+        if (getProxyState(pageUrl) === 'none') return false;
+        var slug = pageSlug(pageUrl);
+        var apiSrtUrl = buildSubtitleApiUrl(pageUrl, 0, 'srt');
         if (!apiSrtUrl) return false;
+        // Color the row by the subtitle source the proxy serves (embedded HLS
+        // subtitles need assembling -> red, direct sidecar -> green).
+        var pKind = getProxyKind(pageUrl) === 'hls' ? 'hls' : 'srt';
         var apiLabel = document.createElement('div');
         apiLabel.style.cssText = 'font-weight:bold;color:#7ab8ff;margin-bottom:6px;font-size:11px;';
         if (addTopMargin) apiLabel.style.marginTop = '8px';
         apiLabel.textContent = 'Proxy';
         sSection.appendChild(apiLabel);
 
-        sSection.appendChild(buildItemRow('SRT', apiSrtUrl, [makeApiDownloadBtn(apiSrtUrl, slug + '_0.srt')]));
+        sSection.appendChild(buildItemRow('SRT', apiSrtUrl, [makeApiDownloadBtn(apiSrtUrl, slug + '.srt', pKind)], pKind));
+
+        // First sight of this video: ask the proxy whether subtitles exist,
+        // then re-render so the row disappears on a no_subtitles answer.
+        if (getProxyState(pageUrl) === 'unknown') {
+            probeProxy(pageUrl, function() {
+                renderResults(currentData);
+            });
+        }
         return true;
     }
 
@@ -1324,6 +1524,14 @@ var DEBUG = true;
              ' qualities=' + data.qualities.length + ' pageUrl=' + (data.pageUrl ? 'yes' : 'no') +
              ' loadError=' + (data.loadError ? 'yes' : 'no'));
         currentData = data;
+        // Color the format rows (Master/qualities) by how this video's
+        // subtitles are delivered: direct sidecar SRT -> green (direct),
+        // HLS-embedded -> red (needs assembling). Falls back to the
+        // proxy-reported source when no local subtitle was found.
+        var fmtKind = null;
+        if (data.srt.length > 0) fmtKind = 'srt';
+        else if (data.hlsSubtitles.length > 0) fmtKind = 'hls';
+        else if (data.pageUrl && getProxyKind(data.pageUrl)) fmtKind = getProxyKind(data.pageUrl);
         var body = createPanel();
         body.innerHTML = '';
 
@@ -1347,7 +1555,7 @@ var DEBUG = true;
             var masterSection = document.createElement('div');
             masterSection.style.cssText = 'margin-bottom:10px;';
 
-            masterSection.appendChild(buildItemRow('Master', data.m3u8));
+            masterSection.appendChild(buildItemRow('Master', data.m3u8, null, fmtKind));
             body.appendChild(masterSection);
         }
 
@@ -1380,7 +1588,7 @@ var DEBUG = true;
 
             for (var q = 0; q < data.qualities.length; q++) {
                 var v = data.qualities[q];
-                qSection.appendChild(buildItemRow(v.label, v.url));
+                qSection.appendChild(buildItemRow(v.label, v.url, null, fmtKind));
             }
             body.appendChild(qSection);
         }
@@ -1394,6 +1602,8 @@ var DEBUG = true;
         // Proxied subtitles resolve server-side from the video page URL, so
         // they are offered even when local detection found nothing.
         var hasProxy = !!(data.pageUrl && isApiConfigured());
+        // Offered unless the proxy already answered "no subtitles".
+        var proxyShown = hasProxy && getProxyState(data.pageUrl) !== 'none';
 
         if (data.srt.length > 0) {
             sLabel.textContent = 'SRT';
@@ -1402,7 +1612,7 @@ var DEBUG = true;
             for (var s = 0; s < data.srt.length; s++) {
                 var sub = data.srt[s];
                 var sLabel2 = sub.label || 'SRT';
-                sSection.appendChild(buildItemRow(sLabel2, sub.url, [makeDownloadBtn(sub.url, subtitleDownloadName(data.pageUrl, s, getSrtFilename(sub.url)))]));
+                sSection.appendChild(buildItemRow(sLabel2, sub.url, [makeDownloadBtn(sub.url, subtitleDownloadName(data.pageUrl, s, getSrtFilename(sub.url)))], 'srt'));
             }
         }
 
@@ -1417,7 +1627,7 @@ var DEBUG = true;
             for (var h = 0; h < data.hlsSubtitles.length; h++) {
                 var hsub = data.hlsSubtitles[h];
                 var hLabel = hsub.name || 'HLS';
-                sSection.appendChild(buildItemRow(hLabel, hsub.url, [makeHlsDownloadBtn(hsub.url, subtitleDownloadName(data.pageUrl, h, 'subtitle_' + hsub.lang + '.srt'))]));
+                sSection.appendChild(buildItemRow(hLabel, hsub.url, [makeHlsDownloadBtn(hsub.url, subtitleDownloadName(data.pageUrl, h, 'subtitle_' + hsub.lang + '.srt'))], 'hls'));
             }
         }
 
@@ -1425,18 +1635,22 @@ var DEBUG = true;
             appendProxySection(sSection, data, hasAnySub);
         }
 
-        if (!hasAnySub && !hasProxy) {
+        if (!hasAnySub && !proxyShown) {
             sLabel.style.cssText = 'font-weight:bold;color:#888;margin-bottom:6px;font-size:11px;';
             sLabel.textContent = 'No subtitles available';
             sSection.appendChild(sLabel);
             var hint = document.createElement('div');
             hint.style.cssText = 'font-size:10px;color:#666;margin-top:4px;';
-            if (!isApiConfigured()) {
-                hint.textContent = 'Proxy API not configured (set API_BASE and API_TOKEN).';
-            } else if (!data.pageUrl) {
-                hint.textContent = 'Proxy unavailable: no video page URL found.';
-            } else {
-                hint.textContent = '';
+            if (!hasProxy) {
+                if (!isApiConfigured()) {
+                    hint.textContent = 'Proxy API not configured (set API_BASE and API_TOKEN).';
+                } else if (!data.pageUrl) {
+                    hint.textContent = 'Proxy unavailable: no video page URL found.';
+                } else {
+                    hint.textContent = '';
+                }
+            } else if (getProxyState(data.pageUrl) === 'none') {
+                hint.textContent = 'Proxy reports no subtitle tracks for this video.';
             }
             if (hint.textContent) sSection.appendChild(hint);
         }
