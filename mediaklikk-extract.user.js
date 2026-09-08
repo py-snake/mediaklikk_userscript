@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MediaKlikk Stream Extractor
 // @namespace    mediaklikk-tools
-// @version      1.9.1
+// @version      1.9.2
 // @description  Extract m3u8 (all qualities), master m3u8, and SRT subtitle links from MediaKlikk videos (runs inside the player iframe)
 // @author       py-snake and opencode
 // @match        https://player.mediaklikk.hu/*
@@ -124,11 +124,29 @@ var DEBUG = true;
 
     // --- M3U8 parsing ---
 
+    // Remove the CDN's useless "ip" parameter (?ip:... or &ip:...) from a URL,
+    // keeping any other query params. The CDN checks the real IP, not this.
+    function stripCdnIpParam(url) {
+        if (typeof url !== 'string' || !url) return url;
+        var qi = url.indexOf('?');
+        if (qi < 0) return url;
+        var base = url.substring(0, qi);
+        var q = url.substring(qi + 1);
+        if (!q) return base;
+        var kept = [];
+        var parts = q.split('&');
+        for (var i = 0; i < parts.length; i++) {
+            if (/^ip:/.test(parts[i])) continue;
+            kept.push(parts[i]);
+        }
+        return kept.length ? (base + '?' + kept.join('&')) : base;
+    }
+
     // Normalize protocol-relative URLs (//cdn...) to absolute https URLs.
     function normalizeUrl(url) {
         if (!url) return url;
-        if (url.indexOf('//') === 0) return 'https:' + url;
-        return url;
+        if (url.indexOf('//') === 0) return stripCdnIpParam('https:' + url);
+        return stripCdnIpParam(url);
     }
 
     // Resolve a possibly-relative URL against a base directory.
@@ -136,15 +154,15 @@ var DEBUG = true;
     // Root-absolute (/path/...) resolves against the origin root, not baseDir.
     function resolveUrl(url, baseDir) {
         if (!url) return url;
-        if (url.indexOf('//') === 0) return 'https:' + url;
-        if (/^https?:\/\//i.test(url)) return url;
+        if (url.indexOf('//') === 0) return stripCdnIpParam('https:' + url);
+        if (/^https?:\/\//i.test(url)) return stripCdnIpParam(url);
         if (url.charAt(0) === '/') {
             var m = (typeof baseDir === 'string' ? baseDir : '').match(/^(https?:\/\/[^\/]+)/i);
-            if (m) return m[1] + url;
+            if (m) return stripCdnIpParam(m[1] + url);
             return url;
         }
         if (typeof baseDir !== 'string' || !baseDir) return url;
-        return baseDir + url;
+        return stripCdnIpParam(baseDir + url);
     }
 
     function compactQualityLabel(res, bw) {
